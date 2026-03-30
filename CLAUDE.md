@@ -1,8 +1,10 @@
-# NEXUS AI - XAUUSD Self-Healing Scalper
+# NEXUS AI v3 - XAUUSD Aggressive Self-Healing Scalper
 
 ## Overview
 
-AI Trading Agent untuk scalping XAUUSD (Gold) di MetaTrader 5 dengan kemampuan **self-healing** dan **self-optimization** otomatis.
+AI Trading Agent untuk scalping **XAUUSD (Gold)** di MetaTrader 5 dengan 3 strategi entry,
+4-timeframe confluence, dual-TP execution, pyramid add-on, dan engine **self-healing** berbasis
+Kelly criterion + Calmar ratio.
 
 ## Arsitektur Sistem
 
@@ -10,16 +12,16 @@ AI Trading Agent untuk scalping XAUUSD (Gold) di MetaTrader 5 dengan kemampuan *
 NexusAI/
 ├── MQL5/
 │   ├── Experts/
-│   │   └── NexusAI_XAUUSD_Scalper.mq5     ← EA utama (pasang di MT5)
+│   │   └── NexusAI_XAUUSD_Scalper.mq5     ← EA utama v3 (pasang di MT5)
 │   ├── Include/
-│   │   ├── RiskManager.mqh                 ← Manajemen risiko & lot sizing
-│   │   ├── MarketAnalyzer.mqh              ← Analisis pasar multi-timeframe
-│   │   ├── SelfHealer.mqh                  ← Engine self-healing & optimasi
-│   │   └── TradeManager.mqh                ← Eksekusi & manajemen trade
+│   │   ├── RiskManager.mqh                 ← Kelly lot sizing, tiered recovery
+│   │   ├── MarketAnalyzer.mqh              ← 4-TF analysis, 3 signal types
+│   │   ├── SelfHealer.mqh                  ← 9-action AI heal engine
+│   │   └── TradeManager.mqh                ← Dual-TP, pyramid, ATR trailing
 │   └── Scripts/
-│       └── NexusAI_ReportGenerator.mq5     ← Generate laporan HTML/CSV
+│       └── NexusAI_ReportGenerator.mq5     ← HTML/CSV performance report
 └── Python/
-    ├── nexus_optimizer.py                   ← Optimizer eksternal berbasis ML
+    ├── nexus_optimizer.py                   ← ML optimizer + equity chart
     └── requirements.txt
 ```
 
@@ -33,181 +35,189 @@ Copy MQL5/Experts/*.mq5  →  [MT5 Data Folder]/MQL5/Experts/NexusAI/
 Copy MQL5/Scripts/*.mq5  →  [MT5 Data Folder]/MQL5/Scripts/NexusAI/
 ```
 
-> Buka MT5 → File → Open Data Folder untuk menemukan lokasi folder
+> MT5 → File → Open Data Folder untuk menemukan lokasi folder
 
-### 2. Compile EA
+### 2. Compile
 
-Di MetaEditor (F4 di MT5):
-- Buka `NexusAI_XAUUSD_Scalper.mq5`
-- Tekan F7 untuk compile
-- Pastikan **0 errors**
+MetaEditor (F4) → Buka `NexusAI_XAUUSD_Scalper.mq5` → F7 → **0 errors**
 
 ### 3. Pasang di Chart
 
-1. Buka chart **XAUUSD** timeframe **M5**
-2. Drag & drop EA ke chart
-3. Aktifkan **"Allow Algo Trading"**
-4. Set parameter input sesuai kebutuhan
+1. Chart **XAUUSD M5** → Drag EA
+2. Aktifkan **"Allow Algo Trading"**
+3. Set input parameters
 
 ## Parameter Penting
 
 | Parameter | Default | Keterangan |
 |-----------|---------|-----------|
-| `InpRiskPercent` | 1.0 | % risiko per trade (rekomendasi: 0.5-2%) |
-| `InpMaxDailyLoss` | 5.0 | Stop trading jika rugi >5% hari ini |
-| `InpMaxDrawdown` | 15.0 | Stop trading jika DD >15% total |
-| `InpMaxConsecLoss` | 5 | Masuk recovery mode setelah 5 loss berturut |
+| `InpRiskPercent` | 1.5 | Base risk % per trade (Kelly-blended) |
+| `InpMaxDailyLoss` | 6.0 | Halt jika rugi >6% hari ini |
+| `InpMaxDrawdown` | 18.0 | Halt jika total DD >18% |
+| `InpMaxConsecLoss` | 4 | Konsekutif loss → naik 1 recovery tier |
+| `InpCompoundMode` | true | Risk scale naik seiring pertumbuhan balance |
+| `InpPyramidEnabled` | true | Add ke winner saat profit > 1.5 ATR |
 | `InpSelfHealEnabled` | true | Aktifkan engine self-healing |
-| `InpOptimizeCycle` | 20 | Optimasi parameter tiap 20 trade |
-| `InpHealPauseMins` | 60 | Pause trading 60 menit setelah healing kritis |
-| `InpSessionFilter` | true | Hanya trade saat London/NY session |
-| `InpMaxSpreadPts` | 50 | Tolak sinyal jika spread >50 poin |
+| `InpOptimizeCycle` | 20 | Heal cycle tiap 20 trade |
+| `InpShortPauseMins` | 30 | Pause singkat setelah degradasi |
+| `InpLongPauseMins` | 120 | Pause panjang setelah degradasi parah |
+| `InpSessionFilter` | true | Hanya London + NY session |
+| `InpOverlapBonus` | true | Signal kuat ekstra di overlap session |
+| `InpMaxSpreadPts` | 45 | Tolak sinyal jika spread >45 poin |
 
-## Strategi Trading
+## Strategi Trading v3
 
-### Multi-Timeframe Confluence
+### 4-Timeframe Confluence
 
 ```
-H1  → Trend filter (EMA 9/21 + Ichimoku Cloud)
-M15 → Konfirmasi arah (EMA cross)
-M5  → Entry signal (EMA + RSI + MACD + Stoch + ADX + BB)
+H4  → Macro bias (EMA 50/200 - bull/bear market)
+H1  → Trend (EMA 8/21 + Ichimoku Cloud)
+M15 → Konfirmasi arah (EMA alignment)
+M5  → Entry precise (EMA + RSI + MACD + BB + ADX + CCI + Stoch)
 ```
 
-### Scoring System (min 8/13 untuk entry)
+### 3 Tipe Sinyal
 
-| Indikator | Bobot | Kondisi |
-|-----------|-------|---------|
-| H1 Trend (EMA+Ichimoku) | 3 | Fast EMA di atas Slow + price di atas cloud |
-| M15 EMA | 2 | Fast EMA cross slow |
-| M5 EMA Cross | 2 | Crossover baru di M5 |
-| MACD | 2 | Main di atas signal, di atas/bawah 0 |
-| ADX | 1 | > 20 (ada tren yang jelas) |
-| RSI | 1 | Tidak overbought/oversold |
-| Stochastic | 1 | Konfirmasi arah |
-| Bollinger Bands | 1 | Bounce/reject dari band |
+| Tipe | Kondisi | Karakteristik |
+|------|---------|---------------|
+| **MOMENTUM** | EMA cross + MACD cross fresh | Agresif, ikut breakout |
+| **PULLBACK** | BB pullback + M15 aligned + above/below trend EMA | Masuk di retest |
+| **BREAKOUT** | BB break + ADX >35 + H1 strong | Wide TP, tight SL |
+
+### Scoring System (min 7/15, turun ke 6 jika ADX >35)
+
+| Faktor | Bobot | Kondisi |
+|--------|-------|---------|
+| H4 Bias (EMA 50/200) | 2 | Bull or bear alignment |
+| H1 Strong Trend | 3 | EMA + Ichimoku + RSI |
+| H1 Basic Trend | 1 | EMA only |
+| M15 EMA Aligned | 1 | Fast > Slow |
+| M5 EMA Fresh Cross | 2 | Crossover baru |
+| M5 EMA Aligned | 1 | Tanpa crossover |
+| MACD Fresh Cross | 2 | Signal bersamaan crossover |
+| MACD Aligned | 1 | Direction saja |
+| Stoch Cross | 1 | Konfirmasi |
+| RSI + CCI | 1+1 | Momentum confirmation |
+| Price Action | 1 | Pin bar / Engulfing / Strong candle |
+| ADX Trend | +1/-1 | >20 bonus, <20 penalty |
 
 ### Session Filter (GMT)
 
 - **London**: 07:00-16:00 GMT ✅
 - **New York**: 13:00-21:00 GMT ✅
-- **Overlap London/NY**: 13:00-16:00 GMT ✅ (terbaik untuk gold)
-- **Asian low-liquidity**: 00:00-06:00 GMT ❌ (skip)
+- **Overlap L/NY**: 13:00-16:00 GMT ✅ 🌟 **BONUS signal strength +15%**
+- **Asian**: 00:00-06:00 GMT ❌
 
-## Fitur Self-Healing
-
-### Siklus Optimasi (tiap 20 trade)
+## Execution Model - Dual TP
 
 ```
-Win Rate < 40%  → Perketat entry (ADX naik, RSI range dipersempit)
-Win Rate > 60% & PF < 1.5 → Perlebar TP
-PF < 1.2        → Perketat SL (kurangi ATR multiplier)
-PF > 2.5        → Beri SL lebih lebar (kurangi stop-out)
+Buka 2 posisi bersamaan:
+  Posisi 1 (50% lot) → TP1 = 2.0 × ATR  (partial close)
+  Posisi 2 (50% lot) → TP2 = 3.5 × ATR  (runner, dinaikkan dengan trailing)
+
+Break-even: setelah profit ≥ 0.8 × ATR → SL pindah ke BE
+Trailing  : setelah profit ≥ 1.0 × ATR → trail di 1.0 × ATR
+Pyramid   : setelah profit ≥ 1.5 × ATR → tambah 50% lot lagi
 ```
 
-### Healing Actions
+## Self-Healing Engine v3
+
+### Kelly-Blended Lot Sizing
+
+```
+BaseRisk = FixedFraction × 0.70 + (HalfKelly) × 0.30
+Adjusted = BaseRisk × SignalStrength(0.8x - 1.2x) × TierMultiplier
+```
+
+### 4-Level Recovery Tiers
+
+| Tier | Konsekutif Loss | Lot Multiplier |
+|------|----------------|----------------|
+| 0 | Normal | 100% |
+| 1 | ≥ 4 loss | 75% |
+| 2 | ≥ 4 loss lagi | 50% |
+| 3 | ≥ 4 loss lagi | 25% |
+
+Tier turun 1 setiap 5 win setelah masuk recovery.
+
+### 9 Healing Actions
 
 | Action | Kondisi | Efek |
 |--------|---------|------|
-| `TIGHTEN_ENTRY` | WR < 42% | ADX min naik, RSI range dipersempit |
-| `WIDEN_TP` | WR > 50% & PF < 1.3 | ATR TP multiplier bertambah |
-| `TIGHTEN_SL` | Avg loss > 2x avg win | ATR SL multiplier berkurang |
-| `REDUCE_RISK` | DD > 8% | Risk per trade dikurangi |
-| `PAUSE_TRADING` | WR < 30% & PF < 1.0 | Pause 60 menit (default) |
-| `RESET_PARAMS` | 3x degradasi kritis berturut | Reset + pause 2 jam |
+| `TIGHTEN_ENTRY` | WR < 42% | ADX+, RSI range ketat, score threshold+ |
+| `RELAX_ENTRY` | WR > 60% & PF > 2.0 | ADX-, score- |
+| `WIDEN_TP` | WR > 60% & PF < 1.5 | ATR TP2 multiplier+ |
+| `TIGHTEN_SL` | AvgLoss > 1.3x AvgWin | ATR SL- |
+| `WIDEN_SL` | AvgWin > 2.5x AvgLoss | ATR SL+ |
+| `REDUCE_RISK` | DD > 10% | Recovery tier naik |
+| `PAUSE_SHORT` | WR < 40% & degrading | Pause 30 menit |
+| `PAUSE_LONG` | WR < 33% & PF < 1.0 | Pause 2 jam |
+| `FULL_RESET` | Degradasi 3x berturut | Reset params + 2 jam pause |
 
-### Recovery Mode
-
-Setelah 5 consecutive losses → lot size otomatis dikurangi 50% untuk 5 trade berikutnya.
-
-## Risk Management
-
-### Lot Sizing (ATR-based)
+### Regime Detection
 
 ```
-Lot = (Balance × Risk%) / (SL_pips × PipValue)
-SL  = MathMax(input_SL, ATR × 0.5)  ← pakai yang lebih besar
+ADX > 30  → TRENDING  → prioritas MOMENTUM & BREAKOUT signals
+ADX < 20  → RANGING   → prioritas PULLBACK signals
+ADX 20-30 → UNKNOWN   → semua signal aktif
 ```
 
-### Emergency Stop
+### Performance Metrics yang dipantau
 
-- Daily loss > 5% → Halt sampai hari berikutnya
-- Total DD > 15% → Halt (perlu manual reset)
-- 5+ consecutive losses → Recovery mode (half lot)
+- Win Rate (rolling 5 windows vs all-time)
+- Profit Factor
+- Expectancy per trade
+- Kelly % optimal bet fraction
+- Sortino ratio (downside-adjusted return)
+- Calmar ratio (return / max drawdown)
 
-## Python Optimizer (Opsional)
-
-### Install Dependencies
+## Python Optimizer
 
 ```bash
 pip install -r Python/requirements.txt
+
+python nexus_optimizer.py --mode analyze   # Equity curve + stats
+python nexus_optimizer.py --mode optimize  # Generate optimal params JSON
+python nexus_optimizer.py --mode ml        # Train ML signal predictor
 ```
 
-### Penggunaan
+## Testing di MT5 Strategy Tester
 
-```bash
-# Analisis performa + grafik equity
-python Python/nexus_optimizer.py --mode analyze --days 30
+1. **Ctrl+R** → Expert: `NexusAI/NexusAI_XAUUSD_Scalper`
+2. Symbol: XAUUSD | Period: M5
+3. Model: **Every tick based on real ticks**
+4. Date range: minimal 6 bulan
+5. Deposit: $10,000
 
-# Optimasi parameter otomatis
-python Python/nexus_optimizer.py --mode optimize --days 60
+### Parameter Focus untuk Optimization Pass
 
-# Backtest sederhana
-python Python/nexus_optimizer.py --mode backtest --days 30
-
-# ML signal predictor training
-python Python/nexus_optimizer.py --mode ml
+```
+InpRiskPercent      : 0.5, 1.0, 1.5, 2.0
+InpTrailAtrMult     : 0.8, 1.0, 1.2, 1.5
+InpBEAtrMult        : 0.5, 0.7, 0.9
+InpPyramidATR       : 1.2, 1.5, 2.0
 ```
 
-Output: `nexus_optimized_params.json` berisi parameter optimal yang bisa di-input ke EA.
+## Konvensi Kode
 
-## Report Generator
+- Class prefix: `C` (e.g. `CRiskManager`)
+- Input prefix: `Inp` (e.g. `InpRiskPercent`)
+- Global prefix: `g_` (e.g. `g_risk`)
+- Panel object prefix: `NX_`
+- Magic Number: **202401** (default)
+- Log prefix: `[ClassName]`
 
-Jalankan script `NexusAI_ReportGenerator.mq5` dari MT5:
-- Script → NexusAI → NexusAI_ReportGenerator
-- Output: `NexusAI_Report.html` + `NexusAI_Report_[date].csv`
-- Tersimpan di `[MT5 Data Folder]/MQL5/Files/Common/`
-
-## File Log & Data
+## File Log
 
 | File | Lokasi | Isi |
 |------|--------|-----|
-| `NexusAI_SelfHeal.log` | MT5 Common Files | Log semua healing actions |
-| `NexusAI_Stats.csv` | MT5 Common Files | Statistik performa (persistent) |
-| `NexusAI_Report.html` | MT5 Common Files | Report HTML terakhir |
-| `nexus_performance.png` | Python dir | Grafik equity curve |
+| `NexusAI_SelfHeal.log` | MT5 Common Files | Semua healing actions |
+| `NexusAI_Stats.csv` | MT5 Common Files | Stats persistent (reload saat restart) |
+| `NexusAI_Report.html` | MT5 Common Files | Report terakhir dari ReportGenerator |
+| `nexus_performance.png` | Python dir | Equity curve chart |
 
-## Konvensi Kode MQL5
+---
 
-- Semua class prefix `C` (e.g. `CRiskManager`)
-- Input variables prefix `Inp` (e.g. `InpRiskPercent`)
-- Global variables prefix `g_` (e.g. `g_risk`)
-- Magic Number: **202401** (default)
-- Semua error di-log dengan `[ClassName]` prefix
-
-## Testing & Backtest
-
-### Strategy Tester MT5
-
-1. Buka Strategy Tester (Ctrl+R)
-2. Expert: `NexusAI/NexusAI_XAUUSD_Scalper`
-3. Symbol: XAUUSD, Period: M5
-4. Model: **Every tick based on real ticks** (paling akurat)
-5. Date: minimal 3-6 bulan data
-6. Deposit: $10,000 recommended untuk test
-
-### Parameter Optimasi di Tester
-
-Parameter yang paling berpengaruh untuk optimization pass:
-- `InpRiskPercent`: 0.5, 1.0, 1.5, 2.0
-- `InpAtrSlMultiplier`: 1.2-2.0 (step 0.2)
-- `InpAtrTpMultiplier`: 2.0-4.0 (step 0.5)
-
-## Catatan Penting
-
-> **DISCLAIMER**: Trading forex/gold melibatkan risiko tinggi. Gunakan pada akun demo
-> terlebih dahulu minimal 1-3 bulan sebelum live. Tidak ada jaminan profit.
-
-- EA ini dioptimalkan untuk **broker ECN/STP** dengan spread rendah (<30 pips untuk XAU)
-- Pastikan broker mengizinkan algorithmic trading pada akun Anda
-- Self-healing memerlukan minimal **30 trade** sebelum baseline terbentuk
-- Disarankan VPS dengan ping <10ms ke server broker untuk eksekusi optimal
+> **DISCLAIMER**: Trading forex/gold melibatkan risiko tinggi. Gunakan akun demo minimal
+> 2-3 bulan sebelum live trading. Tidak ada jaminan profit. Gunakan di broker ECN/STP
+> dengan spread < 25 pts pada XAUUSD.

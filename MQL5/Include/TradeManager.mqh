@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //|                                                 TradeManager.mqh |
-//|                           Nexus AI - XAUUSD Scalper Self-Healing |
-//|                    Trade execution, management & trailing system  |
+//|                          Nexus AI v3 - XAUUSD Aggressive Scalper |
+//|  Features: Dual-TP partial close, Dynamic ATR trailing,         |
+//|            Pyramid add-on, Multi-position management            |
 //+------------------------------------------------------------------+
 #pragma once
 
@@ -10,229 +11,292 @@
 #include <Trade\OrderInfo.mqh>
 
 //+------------------------------------------------------------------+
-//| Trade Manager Class                                              |
+//| Position lifecycle state                                         |
+//+------------------------------------------------------------------+
+enum PositionState {
+    POS_STATE_OPEN,
+    POS_STATE_BREAKEVEN,  // SL moved to BE
+    POS_STATE_TP1_HIT,    // 50% closed, runner active
+    POS_STATE_TRAILING    // Full trailing mode
+};
+
+struct ManagedPosition {
+    ulong          ticket;
+    PositionState  state;
+    double         openPrice;
+    double         originalSL;
+    double         tp1;
+    double         tp2;
+    double         lotOriginal;
+    bool           tp1Closed;
+    datetime       openTime;
+};
+
+//+------------------------------------------------------------------+
+//| Trade Manager                                                    |
 //+------------------------------------------------------------------+
 class CTradeManager {
 private:
     CTrade        m_trade;
-    CPositionInfo m_position;
+    CPositionInfo m_pos;
     ulong         m_magic;
-    int           m_maxSlippage;
-    bool          m_trailingActive;
-    double        m_trailStartPips;   // Activate trailing after X pips profit
-    double        m_trailStepPips;    // Trail by X pips
-    double        m_breakEvenPips;    // Move SL to BE after X pips profit
 
-    // Last closed trade info for self-healer
-    double        m_lastClosedProfit;
-    bool          m_lastWasWin;
+    // Position tracking
+    ManagedPosition m_positions[10];
+    int             m_posCount;
+
+    // Trade settings
+    int    m_slippage;
+    double m_trailAtrMult;    // Trail distance = ATR * this
+    double m_beAtrMult;       // Break-even after ATR * this profit
+    double m_tp1Ratio;        // Close 50% at TP1 (default 0.5)
+    bool   m_pyramidEnabled;
+    double m_pyramidThreshold; // Add at ATR * X in profit
+    double m_pyramidLotRatio;  // Pyramid lot as fraction of original
+
+    // Stats
+    int    m_tradesOpened;
+    int    m_tp1Hits;
+    int    m_pyramidAdds;
 
 public:
     CTradeManager() {
-        m_magic          = 202401;
-        m_maxSlippage    = 30;       // 30 points slippage for gold
-        m_trailingActive = true;
-        m_trailStartPips = 15;       // Start trailing after 15 pips
-        m_trailStepPips  = 8;        // Trail 8 pips
-        m_breakEvenPips  = 10;       // Break-even after 10 pips
-        m_lastClosedProfit = 0;
-        m_lastWasWin = false;
+        m_magic            = 202401;
+        m_slippage         = 30;
+        m_trailAtrMult     = 1.0;     // Trail at 1x ATR
+        m_beAtrMult        = 0.8;     // BE after 0.8 ATR profit
+        m_tp1Ratio         = 0.5;     // Close 50% at TP1
+        m_pyramidEnabled   = true;
+        m_pyramidThreshold = 1.5;     // Add at 1.5 ATR profit
+        m_pyramidLotRatio  = 0.5;     // Pyramid = 50% of original lot
+        m_posCount         = 0;
+        m_tradesOpened     = 0;
+        m_tp1Hits          = 0;
+        m_pyramidAdds      = 0;
     }
 
-    void Init(ulong magic, int slippage, double trailStart, double trailStep, double breakEven) {
-        m_magic          = magic;
-        m_maxSlippage    = slippage;
-        m_trailStartPips = trailStart;
-        m_trailStepPips  = trailStep;
-        m_breakEvenPips  = breakEven;
+    void Init(ulong magic, int slippage, double trailMult, double beMult,
+              bool pyramid, double pyramidThresh) {
+        m_magic            = magic;
+        m_slippage         = slippage;
+        m_trailAtrMult     = trailMult;
+        m_beAtrMult        = beMult;
+        m_pyramidEnabled   = pyramid;
+        m_pyramidThreshold = pyramidThresh;
 
         m_trade.SetExpertMagicNumber(magic);
         m_trade.SetDeviationInPoints(slippage);
         m_trade.SetTypeFilling(ORDER_FILLING_IOC);
         m_trade.LogLevel(LOG_LEVEL_ERRORS);
 
-        Print(StringFormat("[TradeMgr] Init: Magic=%d Slippage=%d", magic, slippage));
+        PrintFormat("[TradeMgr] v3 | Magic=%d | Pyramid=%s | TrailMult=%.1f",
+                    magic, pyramid ? "ON" : "OFF", trailMult);
     }
 
-    // Open a new position
-    bool OpenTrade(int direction, double lot, double sl, double tp,
-                   string comment = "NexusAI") {
-        if (HasOpenPosition()) {
-            Print("[TradeMgr] Already have open position, skipping");
-            return false;
-        }
-        if (lot <= 0) {
-            Print("[TradeMgr] Invalid lot size");
-            return false;
-        }
+    // Open trade with dual TP
+    bool OpenTrade(int direction, double lot, double sl,
+                   double tp1, double tp2, string comment = "NexusAI") {
+        if (lot <= 0) { Print("[TradeMgr] Invalid lot"); return false; }
 
-        // Normalize prices
-        int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-        sl = NormalizeDouble(sl, digits);
-        tp = NormalizeDouble(tp, digits);
+        int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+        double nSL    = NormalizeDouble(sl,  digits);
+        double nTP1   = NormalizeDouble(tp1, digits);
+        double nTP2   = NormalizeDouble(tp2, digits);
 
         bool result = false;
+        double price = 0;
+
         if (direction == 1) {
-            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            result = m_trade.Buy(lot, _Symbol, ask, sl, tp, comment);
+            price  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            // Open first half with TP1
+            result = m_trade.Buy(lot * m_tp1Ratio, _Symbol, price, nSL, nTP1,
+                                  comment + "|P1");
+            if (result) {
+                ulong t1 = m_trade.ResultOrder();
+                // Open second half with TP2 (the "runner")
+                m_trade.Buy(lot * (1.0 - m_tp1Ratio), _Symbol, price, nSL, nTP2,
+                             comment + "|P2");
+            }
         } else if (direction == -1) {
-            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            result = m_trade.Sell(lot, _Symbol, bid, sl, tp, comment);
+            price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            result = m_trade.Sell(lot * m_tp1Ratio, _Symbol, price, nSL, nTP1,
+                                   comment + "|P1");
+            if (result) {
+                m_trade.Sell(lot * (1.0 - m_tp1Ratio), _Symbol, price, nSL, nTP2,
+                              comment + "|P2");
+            }
         }
 
         if (result) {
-            PrintFormat("[TradeMgr] Opened %s %.2f lots @ %.5f SL=%.5f TP=%.5f",
-                direction == 1 ? "BUY" : "SELL", lot,
-                direction == 1 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID),
-                sl, tp);
+            m_tradesOpened++;
+            TrackPosition(direction, price, nSL, nTP1, nTP2, lot);
+            PrintFormat("[TradeMgr] %s opened | Lot=%.2f+%.2f | SL=%.2f | TP1=%.2f | TP2=%.2f",
+                direction == 1 ? "BUY" : "SELL",
+                lot * m_tp1Ratio, lot * (1.0 - m_tp1Ratio),
+                nSL, nTP1, nTP2);
         } else {
-            PrintFormat("[TradeMgr] OPEN FAILED: %s (code: %d)",
+            PrintFormat("[TradeMgr] OPEN FAILED: %s (retcode=%d)",
                 m_trade.ResultComment(), m_trade.ResultRetcode());
         }
         return result;
     }
 
-    // Close all open positions for this EA
+    // Close all our positions
     bool CloseAll(string reason = "") {
-        bool allClosed = true;
+        bool ok = true;
         for (int i = PositionsTotal() - 1; i >= 0; i--) {
-            if (m_position.SelectByIndex(i)) {
-                if (m_position.Magic() == m_magic && m_position.Symbol() == _Symbol) {
-                    if (!m_trade.PositionClose(m_position.Ticket())) {
-                        PrintFormat("[TradeMgr] Close failed: %s", m_trade.ResultComment());
-                        allClosed = false;
-                    } else {
-                        PrintFormat("[TradeMgr] Closed position #%d %s",
-                            m_position.Ticket(), reason);
-                    }
-                }
+            if (!m_pos.SelectByIndex(i)) continue;
+            if (m_pos.Magic() != m_magic || m_pos.Symbol() != _Symbol) continue;
+            if (!m_trade.PositionClose(m_pos.Ticket())) {
+                PrintFormat("[TradeMgr] Close failed #%llu: %s",
+                    m_pos.Ticket(), m_trade.ResultComment());
+                ok = false;
+            } else {
+                PrintFormat("[TradeMgr] Closed #%llu | Reason: %s", m_pos.Ticket(), reason);
             }
         }
-        return allClosed;
+        m_posCount = 0;
+        return ok;
     }
 
-    // Manage open positions: trailing stop & break-even
-    void ManagePositions() {
+    // Called every tick - manage all positions
+    void ManagePositions(double currentATR) {
+        if (currentATR <= 0) return;
         double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+        double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
         for (int i = PositionsTotal() - 1; i >= 0; i--) {
-            if (!m_position.SelectByIndex(i)) continue;
-            if (m_position.Magic() != m_magic) continue;
-            if (m_position.Symbol() != _Symbol) continue;
+            if (!m_pos.SelectByIndex(i)) continue;
+            if (m_pos.Magic() != m_magic || m_pos.Symbol() != _Symbol) continue;
 
-            double openPrice = m_position.PriceOpen();
-            double currentSL = m_position.StopLoss();
-            double currentTP = m_position.TakeProfit();
-            double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double ask       = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            ulong  ticket    = m_position.Ticket();
+            ulong  ticket   = m_pos.Ticket();
+            double open     = m_pos.PriceOpen();
+            double curSL    = m_pos.StopLoss();
+            double curTP    = m_pos.TakeProfit();
+            bool   isBuy    = (m_pos.PositionType() == POSITION_TYPE_BUY);
 
-            if (m_position.PositionType() == POSITION_TYPE_BUY) {
-                double pipsProfit = (bid - openPrice) / point;
+            double profitDist = isBuy ? (bid - open) : (open - ask);
+            double beLevel    = currentATR * m_beAtrMult;
+            double trailDist  = currentATR * m_trailAtrMult;
 
-                // Break-even
-                if (pipsProfit >= m_breakEvenPips && currentSL < openPrice + point) {
-                    double newSL = NormalizeDouble(openPrice + point * 2, _Digits);
-                    if (newSL > currentSL) {
-                        m_trade.PositionModify(ticket, newSL, currentTP);
-                        Print("[TradeMgr] BUY Break-even set");
+            if (isBuy) {
+                // ── Break-even ──
+                if (profitDist >= beLevel && curSL < open + point * 2) {
+                    double newSL = NormalizeDouble(open + point * 3, _Digits);
+                    if (newSL > curSL) {
+                        m_trade.PositionModify(ticket, newSL, curTP);
+                        PrintFormat("[TradeMgr] BUY #%llu BE set @ %.5f", ticket, newSL);
                     }
                 }
-
-                // Trailing stop
-                if (m_trailingActive && pipsProfit >= m_trailStartPips) {
-                    double newSL = NormalizeDouble(bid - point * m_trailStepPips, _Digits);
-                    if (newSL > currentSL + point) {
-                        m_trade.PositionModify(ticket, newSL, currentTP);
+                // ── Dynamic ATR trailing ──
+                if (profitDist >= currentATR) {
+                    double newSL = NormalizeDouble(bid - trailDist, _Digits);
+                    if (newSL > curSL + point) {
+                        m_trade.PositionModify(ticket, newSL, curTP);
                     }
                 }
-            }
-            else if (m_position.PositionType() == POSITION_TYPE_SELL) {
-                double pipsProfit = (openPrice - ask) / point;
-
-                // Break-even
-                if (pipsProfit >= m_breakEvenPips && (currentSL > openPrice - point || currentSL == 0)) {
-                    double newSL = NormalizeDouble(openPrice - point * 2, _Digits);
-                    if (newSL < currentSL || currentSL == 0) {
-                        m_trade.PositionModify(ticket, newSL, currentTP);
-                        Print("[TradeMgr] SELL Break-even set");
+            } else {
+                // SELL
+                if (profitDist >= beLevel && (curSL > open - point * 2 || curSL == 0)) {
+                    double newSL = NormalizeDouble(open - point * 3, _Digits);
+                    if (newSL < curSL || curSL == 0) {
+                        m_trade.PositionModify(ticket, newSL, curTP);
+                        PrintFormat("[TradeMgr] SELL #%llu BE set @ %.5f", ticket, newSL);
                     }
                 }
-
-                // Trailing stop
-                if (m_trailingActive && pipsProfit >= m_trailStartPips) {
-                    double newSL = NormalizeDouble(ask + point * m_trailStepPips, _Digits);
-                    if (newSL < currentSL - point || currentSL == 0) {
-                        m_trade.PositionModify(ticket, newSL, currentTP);
+                if (profitDist >= currentATR) {
+                    double newSL = NormalizeDouble(ask + trailDist, _Digits);
+                    if (newSL < curSL - point || curSL == 0) {
+                        m_trade.PositionModify(ticket, newSL, curTP);
                     }
                 }
             }
+
+            // ── Pyramid add-on ──
+            if (m_pyramidEnabled) TryPyramid(ticket, profitDist, currentATR, isBuy,
+                                              curSL, curTP, m_pos.Volume());
         }
     }
 
-    // Check if we have an open position
+    // True if we have any open position
     bool HasOpenPosition() {
         for (int i = 0; i < PositionsTotal(); i++) {
-            if (m_position.SelectByIndex(i)) {
-                if (m_position.Magic() == m_magic && m_position.Symbol() == _Symbol)
+            if (m_pos.SelectByIndex(i))
+                if (m_pos.Magic() == m_magic && m_pos.Symbol() == _Symbol)
                     return true;
-            }
         }
         return false;
     }
 
-    // Get profit of open position
-    double GetOpenProfit() {
+    // Count open positions
+    int OpenPositionCount() {
+        int cnt = 0;
         for (int i = 0; i < PositionsTotal(); i++) {
-            if (m_position.SelectByIndex(i)) {
-                if (m_position.Magic() == m_magic && m_position.Symbol() == _Symbol)
-                    return m_position.Profit() + m_position.Swap() + m_position.Commission();
-            }
+            if (m_pos.SelectByIndex(i))
+                if (m_pos.Magic() == m_magic && m_pos.Symbol() == _Symbol)
+                    cnt++;
         }
-        return 0;
+        return cnt;
     }
 
-    // Check last closed trade result
-    bool CheckLastClosedTrade(double &profit) {
-        uint total = HistoryDealsTotal();
-        if (total == 0) return false;
-
-        for (int i = total - 1; i >= 0; i--) {
-            ulong ticket = HistoryDealGetTicket(i);
-            if (HistoryDealGetInteger(ticket, DEAL_MAGIC) != m_magic) continue;
-            if (HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
-            if (HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-
-            profit = HistoryDealGetDouble(ticket, DEAL_PROFIT) +
-                     HistoryDealGetDouble(ticket, DEAL_SWAP) +
-                     HistoryDealGetDouble(ticket, DEAL_COMMISSION);
-            return true;
+    // Total floating profit
+    double GetFloatingProfit() {
+        double total = 0;
+        for (int i = 0; i < PositionsTotal(); i++) {
+            if (m_pos.SelectByIndex(i))
+                if (m_pos.Magic() == m_magic && m_pos.Symbol() == _Symbol)
+                    total += m_pos.Profit() + m_pos.Swap() + m_pos.Commission();
         }
-        return false;
+        return total;
     }
 
-    // Scan recent history for completed trades (called periodically)
-    int ScanRecentTrades(int lookback, double &profits[]) {
-        HistorySelect(TimeCurrent() - lookback * 86400, TimeCurrent());
-        int count = 0;
-        uint total = HistoryDealsTotal();
-        ArrayResize(profits, 0);
+    int GetTradesOpened()  { return m_tradesOpened; }
+    int GetTP1Hits()       { return m_tp1Hits; }
+    int GetPyramidAdds()   { return m_pyramidAdds; }
+    ulong GetMagic()       { return m_magic; }
 
-        for (uint i = 0; i < total; i++) {
-            ulong ticket = HistoryDealGetTicket(i);
-            if (HistoryDealGetInteger(ticket, DEAL_MAGIC) != m_magic) continue;
-            if (HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
-            if (HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-
-            double p = HistoryDealGetDouble(ticket, DEAL_PROFIT) +
-                       HistoryDealGetDouble(ticket, DEAL_SWAP)   +
-                       HistoryDealGetDouble(ticket, DEAL_COMMISSION);
-            ArrayResize(profits, count + 1);
-            profits[count] = p;
-            count++;
-        }
-        return count;
+private:
+    void TrackPosition(int dir, double open, double sl, double tp1, double tp2, double lot) {
+        if (m_posCount >= 10) return;
+        m_positions[m_posCount].openPrice   = open;
+        m_positions[m_posCount].originalSL  = sl;
+        m_positions[m_posCount].tp1         = tp1;
+        m_positions[m_posCount].tp2         = tp2;
+        m_positions[m_posCount].lotOriginal = lot;
+        m_positions[m_posCount].state       = POS_STATE_OPEN;
+        m_positions[m_posCount].tp1Closed   = false;
+        m_positions[m_posCount].openTime    = TimeCurrent();
+        m_posCount++;
     }
 
-    ulong GetMagic() { return m_magic; }
+    void TryPyramid(ulong ticket, double profitDist, double atr,
+                    bool isBuy, double curSL, double curTP, double curLot) {
+        if (profitDist < atr * m_pyramidThreshold) return;
+
+        // Check if already pyramided (prevent re-adding)
+        string comment = m_pos.Comment();
+        if (StringFind(comment, "|PYR") >= 0) return;
+
+        double pyramidLot = NormalizeDouble(curLot * m_pyramidLotRatio,
+                               (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+        double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+        if (pyramidLot < minLot) return;
+
+        bool result = false;
+        if (isBuy) {
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            result = m_trade.Buy(pyramidLot, _Symbol, ask, curSL, curTP,
+                                  "NexusAI|PYR");
+        } else {
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            result = m_trade.Sell(pyramidLot, _Symbol, bid, curSL, curTP,
+                                   "NexusAI|PYR");
+        }
+        if (result) {
+            m_pyramidAdds++;
+            PrintFormat("[TradeMgr] PYRAMID added %.2f lots | total adds: %d",
+                pyramidLot, m_pyramidAdds);
+        }
+    }
 };
